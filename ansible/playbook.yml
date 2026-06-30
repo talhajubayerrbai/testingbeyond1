@@ -1,0 +1,208 @@
+---
+- name: Configure and deploy FastAPI app
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /opt/app
+    venv_dir: /opt/app/.venv
+    app_user: appuser
+    app_group: appuser
+    gunicorn_bin: /opt/app/.venv/bin/gunicorn
+    gunicorn_entrypoint: "app.main:app"
+    gunicorn_workers: 4
+    gunicorn_bind: "0.0.0.0:8000"
+    # app_src is passed via -e from the CI step
+    app_src: "{{ app_src | default(playbook_dir + '/..') }}"
+
+  tasks:
+
+    # -----------------------------------------------------------------------
+    # System packages
+    # -----------------------------------------------------------------------
+    - name: Install system packages
+      ansible.builtin.dnf:
+        name:
+          - python3.11
+          - python3.11-pip
+          - python3.11-devel
+          - gcc
+          - nginx
+          - git
+        state: present
+        update_cache: true
+
+    # -----------------------------------------------------------------------
+    # App user
+    # -----------------------------------------------------------------------
+    - name: Create app group
+      ansible.builtin.group:
+        name: "{{ app_group }}"
+        system: true
+        state: present
+
+    - name: Create app user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        system: true
+        shell: /sbin/nologin
+        home: "{{ app_dir }}"
+        create_home: false
+        state: present
+
+    # -----------------------------------------------------------------------
+    # App directory
+    # -----------------------------------------------------------------------
+    - name: Create /opt/app directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0755"
+
+    # -----------------------------------------------------------------------
+    # Sync app files from checked-out repo to /opt/app
+    # -----------------------------------------------------------------------
+    - name: Sync application files to /opt/app
+      ansible.posix.synchronize:
+        src: "{{ app_src }}/"
+        dest: "{{ app_dir }}/"
+        delete: true
+        recursive: true
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=__pycache__"
+          - "--exclude=*.pyc"
+          - "--exclude=.venv"
+          - "--exclude=terraform"
+          - "--exclude=ansible"
+          - "--exclude=.github"
+      delegate_to: localhost
+
+    - name: Fix ownership of /opt/app
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        recurse: true
+
+    # -----------------------------------------------------------------------
+    # Python virtual environment
+    # -----------------------------------------------------------------------
+    - name: Create Python 3.11 virtual environment at /opt/app/.venv
+      ansible.builtin.command:
+        cmd: python3.11 -m venv "{{ venv_dir }}"
+        creates: "{{ venv_dir }}/bin/python"
+
+    - name: Upgrade pip inside venv
+      ansible.builtin.command:
+        cmd: "{{ venv_dir }}/bin/pip install --upgrade pip"
+      changed_when: false
+
+    - name: Install Python dependencies from requirements.txt (if present)
+      ansible.builtin.shell: |
+        if [ -f "{{ app_dir }}/requirements.txt" ]; then
+          "{{ venv_dir }}/bin/pip" install -r "{{ app_dir }}/requirements.txt"
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Ensure gunicorn and uvicorn are installed in venv
+      ansible.builtin.command:
+        cmd: "{{ venv_dir }}/bin/pip install gunicorn uvicorn[standard] fastapi"
+      changed_when: false
+
+    - name: Fix venv ownership
+      ansible.builtin.file:
+        path: "{{ venv_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        recurse: true
+
+    # -----------------------------------------------------------------------
+    # Systemd service
+    # -----------------------------------------------------------------------
+    - name: Create systemd service file for gunicorn
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/app.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=FastAPI app via gunicorn+uvicorn
+          After=network.target
+
+          [Service]
+          Type=notify
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_dir }}
+          ExecStart={{ gunicorn_bin }} {{ gunicorn_entrypoint }} -k uvicorn.workers.UvicornWorker -w {{ gunicorn_workers }} -b {{ gunicorn_bind }}
+          Restart=on-failure
+          RestartSec=5s
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=app
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and restart app service
+      ansible.builtin.systemd:
+        name: app
+        enabled: true
+        state: restarted
+
+    # -----------------------------------------------------------------------
+    # Nginx configuration
+    # -----------------------------------------------------------------------
+    - name: Write nginx site configuration
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/app.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80 default_server;
+              server_name _;
+
+              location / {
+                  proxy_pass         http://127.0.0.1:8000;
+                  proxy_set_header   Host              $host;
+                  proxy_set_header   X-Real-IP         $remote_addr;
+                  proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_read_timeout 120s;
+              }
+          }
+
+    - name: Remove default nginx config if present
+      ansible.builtin.file:
+        path: /etc/nginx/conf.d/default.conf
+        state: absent
+
+    - name: Enable and restart nginx
+      ansible.builtin.systemd:
+        name: nginx
+        enabled: true
+        state: restarted
+
+    # -----------------------------------------------------------------------
+    # Verify app is listening locally before CI smoke test
+    # -----------------------------------------------------------------------
+    - name: Wait for gunicorn to be listening on port 8000
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 8000
+        timeout: 60
+        state: started
